@@ -1,0 +1,46 @@
+import torch
+
+
+class Config:
+    input_columns = ['tem', 'heart', 'oxy', 'height', 'weight']
+    output_columns = ['tem', 'heart', 'oxy']
+    static_columns = ['height', 'weight']
+    position = 1
+    ascending = False
+    input_window = 96
+    predict_steps = 16
+    series_dim = len(input_columns)
+    input_dim = len(output_columns)
+    output_dim = len(output_columns)
+    static_dim = len(static_columns)
+    train_ratio = 0.8
+    max_plot_points = 100
+    feature_size = 128
+    num_heads = 8
+    num_layers = 2
+    dim_feedForward = 512
+    dropout = 0.2
+    grad_clip = 0.4
+    batch_size = 32
+    epochs = 100
+    learning_rate = 0.00001
+    patience = 3
+    patience_es = 3
+    huber_delta = 1.0
+    task_weight_temp = 0.1
+    noise_injection_prob = 0.3
+    time_interpolation_prob = 0.2
+    cos_T0 = 10
+    cos_T_mult = 2
+    patience_lr = 1
+    lr_decay = 0.8
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scaler_filename = f'./model/scaler.pkl'
+    target_freq = '5min'
+    model_save_path = './model/best_model.pth'
+    datafile = './data/a.csv'
+    testfile = './data/aaa.csv'
+    predictFilename = f'./data/predict.xlsx'
+    fig_filename = './result/predictions.xlsx'
+    result_filename = './data/predictions.xlsx'
+    metrics_filename = self.result_filename.replace('.xlsx', '_metrics.csv')
