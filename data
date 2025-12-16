@@ -1,0 +1,64 @@
+import pandas as pd
+import numpy as np
+import torch
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import joblib
+
+
+class DataProcessor:
+    def __init__(self, config):
+        self.config = config
+        self.scaler = StandardScaler()
+
+    def load_data(self):
+        df = pd.read_csv(self.config.datafile)
+        ts_data = self.scaler.fit_transform(df[self.config.output_columns].values)
+        joblib.dump(self.scaler, self.config.scaler_filename)
+        static_data = df[self.config.static_columns].values
+        sequences = []
+        for i in range(len(ts_data) - self.config.input_window - self.config.predict_steps + 1):
+            seq_ts = ts_data[i:i + self.config.input_window]
+            label_ts = ts_data[i + self.config.input_window:i + self.config.input_window + self.config.predict_steps]
+            seq_static = static_data[i + self.config.input_window - 1]
+            sequences.append((seq_ts, label_ts, seq_static))
+        return sequences
+
+    def get_batch(self, data, i):
+        batch = data[i:i + self.config.batch_size]
+        inputs_list = [d[0] for d in batch]
+        targets_list = [d[1] for d in batch]
+        static_list = [d[2] for d in batch]  # [B, static_dim]
+        inputs = np.array([self._augment_data(d) for d in inputs_list])
+        targets = np.array(targets_list)
+        x_static = np.array(static_list)
+        decoder_inputs = np.zeros_like(targets)
+        if len(batch) > 0:
+            decoder_inputs[:, 1:, :] = targets[:, :-1, :]
+        inputs = torch.tensor(inputs).float().permute(1, 0, 2).to(self.config.device)
+        targets = torch.tensor(targets).float().permute(1, 0, 2).to(self.config.device)
+        decoder_inputs = torch.tensor(decoder_inputs).float().permute(1, 0, 2).to(self.config.device)
+        x_static = torch.tensor(x_static).float().to(self.config.device)
+        return inputs, decoder_inputs, x_static, targets
+
+    def _augment_data(self, data):
+        if np.random.rand() < self.config.noise_injection_prob:
+            data += np.random.normal(0, 0.01, data.shape)
+        if np.random.rand() < self.config.time_interpolation_prob:
+            seq_len = data.shape[0]
+            insert_idx = np.random.randint(1, seq_len - 1)
+            data[insert_idx] = (data[insert_idx - 1] + data[insert_idx]) / 2
+        return data
+
+    def load_test_data(self):
+        df = pd.read_csv(self.config.testfile)
+        scaler = joblib.load(self.config.scaler_filename)
+        test_ts_data = scaler.transform(df[self.config.output_columns].values)
+        test_static_data = df[self.config.static_columns].values
+        sequences = []
+        for i in range(len(test_ts_data) - self.config.input_window - self.config.predict_steps + 1):
+            seq_ts = test_ts_data[i:i + self.config.input_window]
+            label_ts = test_ts_data[
+                       i + self.config.input_window:i + self.config.input_window + self.config.predict_steps]
+            seq_static = test_static_data[i + self.config.input_window - 1]
+            sequences.append((seq_ts, label_ts, seq_static))
+        return sequences
