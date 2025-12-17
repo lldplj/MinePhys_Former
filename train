@@ -1,0 +1,78 @@
+import torch
+import torch.nn as nn
+from MinePhys_Former.model import HuberLoss
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
+
+
+class Trainer:
+    def __init__(self, model, config, processor, train_data, val_data):
+        self.model = model
+        self.config = config
+        self.processor = processor
+        self.train_data = train_data
+        self.val_data = val_data
+        self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=1e-4,
+            weight_decay=0.01
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=100, eta_min=1e-6)
+        self.criterion = HuberLoss(delta=config.huber_delta)
+        self.best_loss = float('inf')
+        self.no_improve = 0
+
+    def _calculate_loss(self, output, tgt):
+        losses = []
+        total_weight = 0
+        for idx, col in enumerate(self.config.output_columns):
+            task_loss = self.criterion(output[col]['pred'], tgt[..., idx])
+            weight = output[col]['weight']
+            losses.append(task_loss * weight)
+            total_weight += weight
+        return sum(losses) / total_weight
+
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0
+        tgt_mask = self.model.generate_square_subsequent_mask(self.config.predict_steps).to(self.device)
+        for i in range(0, len(self.train_data), self.config.batch_size):
+            src, tgt_shifted, x_static, tgt = self.processor.get_batch(self.train_data, i)
+            self.optimizer.zero_grad()
+            output_dict = self.model(
+                x_seq=src,
+                x_static=x_static,
+                tgt_shifted=tgt_shifted,
+                tgt_mask=tgt_mask,
+                mode='train'
+            )
+            loss = self._calculate_loss(output_dict, tgt)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
+            self.optimizer.step()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / (len(self.train_data) / self.config.batch_size)
+        val_loss, _, stop = self.evaluate()
+        self.scheduler.step()
+        if avg_loss < self.best_loss:
+            self.best_loss = avg_loss
+            self.no_improve = 0
+            torch.save(self.model.state_dict(), self.config.model_save_path)
+            print("Model saved.")
+        else:
+            self.no_improve += 1
+        return avg_loss, val_loss, self.no_improve >= self.config.patience
+
+    def evaluate(self):
+        self.model.eval()
+        total_loss = 0
+        tgt_mask = self.model.generate_square_subsequent_mask(self.config.predict_steps).to(self.device)
+        with torch.no_grad():
+            for i in range(0, len(self.val_data), self.config.batch_size):
+                src, tgt_shifted, x_static, tgt = self.processor.get_batch(self.val_data, i)
+                output_dict = self.model(src, x_static, tgt_shifted, tgt_mask=tgt_mask, mode='train')
+                loss = self._calculate_loss(output_dict, tgt)
+                total_loss += loss.item()
+        avg_val_loss = total_loss / (len(self.val_data) / self.config.batch_size)
+        return avg_val_loss, None, self.no_improve >= self.config.patience
