@@ -1,0 +1,149 @@
+import torch
+import torch.nn as nn
+from MinePhys_Former.config import Config
+from MinePhys_Former.ata import AdaptiveTemporalAlignment, PositionalEncoding
+from MinePhys_Former.mtda import MTDA_Attention
+from MinePhys_Former.dpcm import DualPathChannelModeling
+
+
+class HuberLoss(nn.Module):
+    def __init__(self, delta=1.0):
+        super(HuberLoss, self).__init__()
+        self.delta = delta
+
+    def forward(self, pred, target):
+        error = torch.abs(pred - target)
+        quadratic = torch.min(error, torch.tensor(self.delta, device=pred.device))
+        linear = error - quadratic
+        loss = 0.5 * quadratic ** 2 + self.delta * linear
+        return loss.mean()
+
+
+class MineEncoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        self.mtda = MTDA_Attention(d_model, num_heads, dropout)
+        self.dpcm = DualPathChannelModeling(d_model, dropout)
+
+    def forward(self, x):
+        x = self.mtda(x)  # Mine-specific Temporal Differential Attention
+        x = self.dpcm(x)  # Dual Path Channel Modeling
+        return x
+
+
+class MineDecoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout2 = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.ReLU(),
+            nn.Linear(4 * d_model, d_model)
+        )
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(self, tgt, memory, tgt_mask=None):
+        attn_out, _ = self.self_attn(tgt, tgt, tgt, attn_mask=tgt_mask, need_weights=False)
+        tgt = self.norm1(tgt + self.dropout1(attn_out))
+        memory = memory.contiguous()
+        cross_out, _ = self.cross_attn(
+            query=tgt,
+            key=memory,
+            value=memory,
+            need_weights=False
+        )
+        tgt = self.norm2(tgt + self.dropout2(cross_out))
+        ffn_out = self.ffn(tgt)
+        tgt = self.norm3(tgt + self.dropout3(ffn_out))
+        return tgt
+
+
+class PosteriorCorrection(nn.Module):
+    def __init__(self, output_dim):
+        super().__init__()
+        PHYSIO_FEATURE_DIM = 4
+        self.correction_layer = nn.Linear(PHYSIO_FEATURE_DIM, output_dim)
+
+    def forward(self, pred, static_x):
+        h_cm = static_x[:, 0].unsqueeze(1)  # [B, 1]
+        w_kg = static_x[:, 1].unsqueeze(1)  # [B, 1]
+        h_m = h_cm / 100
+        bmi = w_kg / (h_m ** 2 + 1e-6)
+        bsa = 0.007184 * (h_cm.clamp(min=1e-6) ** 0.725) * (w_kg.clamp(min=1e-6) ** 0.425)
+        physio_features = torch.cat([h_cm, w_kg, bmi, bsa], dim=-1)
+        offset = self.correction_layer(physio_features)
+        return pred + offset.unsqueeze(1)
+
+
+class MinePhysFormer(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        self.ata_module = AdaptiveTemporalAlignment(
+            input_dim=config.input_dim,
+            d_model=config.feature_size,
+            seq_len=config.input_window,
+            dropout=config.dropout
+        )
+        self.encoder_layers = nn.ModuleList([
+            MineEncoderLayer(config.feature_size, config.num_heads, config.dropout)
+            for _ in range(config.num_layers)
+        ])
+        self.decoder_input_proj = nn.Linear(config.output_dim, config.feature_size)
+        self.decoder_pos_encoder = PositionalEncoding(config.feature_size, max_len=config.predict_steps + 10)
+        self.decoder_layers = nn.ModuleList([
+            MineDecoderLayer(config.feature_size, config.num_heads, config.dropout)
+            for _ in range(config.num_layers)
+        ])
+        self.output_layers = nn.ModuleDict({
+            col: nn.Linear(config.feature_size, 1)
+            for col in config.output_columns
+        })
+        self.posterior = PosteriorCorrection(config.output_dim)
+        self.task_errors = {col: 1.0 for col in self.config.output_columns}
+
+    def generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+    def forward(self, x_seq, x_static, tgt_shifted=None, memory=None, tgt_mask=None, mode='train'):
+        if memory is None:
+            x_seq = x_seq.permute(1, 0, 2)  # [B, L_enc, D_in]
+            memory = self.ata_module(x_seq)
+            for layer in self.encoder_layers:
+                memory = layer(memory)
+            memory = memory.contiguous()
+        if mode == 'encode_only':
+            return memory
+        if tgt_shifted is None:
+            raise ValueError("Decoder mode requires tgt_shifted input.")
+        tgt_shifted = tgt_shifted.permute(1, 0, 2)
+        tgt = self.decoder_input_proj(tgt_shifted)
+        tgt = self.decoder_pos_encoder(tgt)
+        tgt = tgt.contiguous()
+        for layer in self.decoder_layers:
+            tgt = layer(tgt, memory, tgt_mask=tgt_mask)  # [B, L_dec, D_model]
+        all_pred_unstacked = []
+        for col in self.config.output_columns:
+            pred_single = self.output_layers[col](tgt)
+            all_pred_unstacked.append(pred_single)
+        pred_all = torch.cat(all_pred_unstacked, dim=-1)
+        final_output = self.posterior(pred_all, x_static)
+        if mode == 'train':
+            output_dict = {}
+            for idx, col in enumerate(self.config.output_columns):
+                # [B, L_dec, 1] -> [L_dec, B]
+                pred_task = final_output[..., idx].permute(1, 0)
+                output_dict[col] = {
+                    'pred': pred_task,
+                    'weight': 1.0
+                }
+            return output_dict
+        return final_output.permute(1, 0, 2)
