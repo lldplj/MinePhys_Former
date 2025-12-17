@@ -1,0 +1,201 @@
+import os
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+
+class Predictor:
+    def __init__(self, model, config, processor):
+        self.model = model
+        self.config = config
+        self.processor = processor
+
+    def predict_and_plot(self, test_data):
+        self.model.eval()
+        test_result = {col: [] for col in self.config.output_columns}
+        truth = {col: [] for col in self.config.output_columns}
+        time_indices = []
+        scaler = joblib.load(self.config.scaler_filename)
+        with torch.no_grad():
+            for idx, (src_norm, tgt_norm, static_data) in enumerate(test_data):
+                src = torch.tensor(src_norm).float().unsqueeze(1).to(self.config.device)
+                x_static = torch.tensor(static_data).float().unsqueeze(0).to(self.config.device)
+                memory = self._encode_memory(src, x_static)
+                predictions_norm = self._autoregressive_predict(memory, x_static)
+                predict_steps = self.config.predict_steps
+                if self.config.ascending:
+                    keep_idx = self.config.position - 1
+                else:
+                    keep_idx = -self.config.position
+                if keep_idx < -predict_steps or keep_idx >= predict_steps:
+                    raise ValueError(f"{self.config.position}（{predict_steps}）")
+                single_pred_norm = predictions_norm[keep_idx:keep_idx + 1, :, :]
+                pred_norm = single_pred_norm.cpu().squeeze(1).numpy()
+                if predictions_norm.size(0) == 0:
+                    pred_rescaled = np.full((1, len(self.config.output_columns)), np.nan)
+                else:
+                    pred_norm = predictions_norm.cpu().squeeze(1).numpy()
+                    if self.config.inverse_transform:
+                        pred_rescaled = scaler.inverse_transform(pred_norm)
+                    else:
+                        pred_rescaled = pred_norm
+                true_rescaled = scaler.inverse_transform(tgt_norm) if self.config.inverse_transform else tgt_norm
+                for i, col in enumerate(self.config.output_columns):
+                    test_result[col].append(pred_rescaled[0, i] if pred_rescaled.shape[0] > 0 else np.nan)
+                    truth[col].append(true_rescaled[0, i])
+                time_indices.append(idx)
+        df = self._format_results(test_result, truth, time_indices)
+        self._calculate_metrics(df)
+        self._plot_results(df)
+        return df
+
+    def _encode_memory(self, src, x_static):
+        memory = self.model(x_seq=src, x_static=x_static, mode='encode_only')
+        return memory
+
+    def _autoregressive_predict(self, memory, x_static):
+        batch_size = memory.size(0)
+        decoder_input = torch.zeros(1, batch_size, len(self.config.output_columns)).to(self.config.device)
+        predictions = []
+        tgt_mask = self.model.generate_square_subsequent_mask(self.config.predict_steps).to(self.config.device)
+
+        for step in range(self.config.predict_steps):
+            current_tgt_input = decoder_input.contiguous()
+            current_mask = tgt_mask[:current_tgt_input.size(0), :current_tgt_input.size(0)]
+            output_dict = self.model(
+                x_seq=None,
+                x_static=x_static,
+                tgt_shifted=current_tgt_input,
+                memory=memory,
+                tgt_mask=current_mask,
+                mode='train'
+            )
+            step_pred_norm = []
+            for col in self.config.output_columns:
+                pred_single = output_dict[col]['pred'][-1, :]
+                step_pred_norm.append(pred_single.unsqueeze(-1))
+            step_pred = torch.cat(step_pred_norm, dim=-1)
+            predictions.append(step_pred)
+            if step < self.config.predict_steps - 1:
+                decoder_input = torch.cat([decoder_input, step_pred.unsqueeze(0)], dim=0)
+        if not predictions:
+            return torch.zeros(0, batch_size, len(self.config.output_columns)).to(self.config.device)
+        return predictions[0].unsqueeze(0)
+
+    def _format_results(self, test_result, truth, time_indices):
+        df_data = {}
+        total_len = len(time_indices)
+        for col in self.config.output_columns:
+            df_data[f'{col}_Pred'] = test_result[col][:total_len]
+            df_data[f'{col}_True'] = truth[col][:total_len]
+        df_data['Index'] = time_indices
+        df = pd.DataFrame(df_data)
+        df.to_excel(self.config.result_filename, index=False)
+        return df
+
+    def _calculate_metrics(self, df):
+        from sklearn.preprocessing import MinMaxScaler
+        from scipy.stats import pearsonr
+        import numpy as np
+
+        max_points = self.config.max_plot_points
+        df_sampled = df.iloc[::self.config.index_result, :]
+        df_sampled = df_sampled.iloc[:max_points]
+        metrics_results = []
+
+        def calculate_smape(y_true, y_pred):
+            denominator = (np.abs(y_true) + np.abs(y_pred)) + 1e-8
+            return 100 * np.mean(2 * np.abs(y_pred - y_true) / denominator)
+        def calculate_pearson(y_true, y_pred):
+            if np.all(y_true == y_true[0]) or np.all(y_pred == y_pred[0]):
+                return np.nan
+            corr, _ = pearsonr(y_true, y_pred)
+            return corr
+
+        for col in self.config.output_columns:
+            y_true_full = df_sampled[f'{col}_True'].values
+            y_pred_full = df_sampled[f'{col}_Pred'].values
+            if len(y_true_full) < 2 or len(y_pred_full) < 2:
+                continue
+            y_true = y_true_full[:-1]
+            y_pred = y_pred_full[1:]
+            mae_raw = mean_absolute_error(y_true, y_pred)
+            mse_raw = mean_squared_error(y_true, y_pred)
+            rmse_raw = np.sqrt(mse_raw)
+            r2_raw = r2_score(y_true, y_pred)
+            smape_raw = calculate_smape(y_true, y_pred)
+            pearson_raw = calculate_pearson(y_true, y_pred)
+            y_true_reshaped = y_true.reshape(-1, 1)
+            y_pred_reshaped = y_pred.reshape(-1, 1)
+            scaler_true = MinMaxScaler()
+            scaler_pred = MinMaxScaler()
+            y_true_normalized = scaler_true.fit_transform(y_true_reshaped).flatten()
+            y_pred_normalized = scaler_pred.fit_transform(y_pred_reshaped).flatten()
+            mae_norm = mean_absolute_error(y_true_normalized, y_pred_normalized)
+            mse_norm = mean_squared_error(y_true_normalized, y_pred_normalized)
+            rmse_norm = np.sqrt(mse_norm)
+            r2_norm = r2_score(y_true_normalized, y_pred_normalized)
+            smape_norm = calculate_smape(y_true_normalized, y_pred_normalized)
+            pearson_norm = calculate_pearson(y_true_normalized, y_pred_normalized)
+            metrics_results.append({
+                'Feature': f'{col} (Raw)',
+                'MAE': f"{mae_raw:.9f}",
+                'MSE': f"{mse_raw:.9f}",
+                'RMSE': f"{rmse_raw:.9f}",
+                'R²': f"{r2_raw:.9f}",
+                'SMAPE(%)': f"{smape_raw:.9f}",
+                'Pearson': f"{pearson_raw:.9f}" if not np.isnan(pearson_raw) else "nan"
+            })
+            metrics_results.append({
+                'Feature': f'{col} (Normalized)',
+                'MAE': f"{mae_norm:.9f}",
+                'MSE': f"{mse_norm:.9f}",
+                'RMSE': f"{rmse_norm:.9f}",
+                'R²': f"{r2_norm:.9f}",
+                'SMAPE(%)': f"{smape_norm:.9f}",
+                'Pearson': f"{pearson_norm:.9f}" if not np.isnan(pearson_norm) else "nan"
+            })
+            print(f"| {'Metric':<12} | {'Raw Value':<20} | {'Normalized':<20} |")
+            print(f"| {'-' * 12} | {'-' * 20} | {'-' * 20} |")
+            print(f"| {'MAE':<12} | {mae_raw:<20.6f} | {mae_norm:<20.9f} |")
+            print(f"| {'MSE':<12} | {mse_raw:<20.6f} | {mse_norm:<20.9f} |")
+            print(f"| {'RMSE':<12} | {rmse_raw:<20.6f} | {rmse_norm:<20.9f} |")
+            print(f"| {'R²':<12} | {r2_raw:<20.6f} | {r2_norm:<20.9f} |")
+            print(f"| {'SMAPE(%)':<12} | {smape_raw:<20.6f} | {smape_norm:<20.9f} |")
+            pearson_raw_str = f"{pearson_raw:.6f}" if not np.isnan(pearson_raw) else "nan"
+            pearson_norm_str = f"{pearson_norm:.9f}" if not np.isnan(pearson_norm) else "nan"
+            print(f"| {'Pearson':<12} | {pearson_raw_str:<20} | {pearson_norm_str:<20} |")
+        print("=" * 80)
+        metrics_df = pd.DataFrame(metrics_results)
+        save_path = self.config.result_filename.replace('.xlsx', '_metrics.xlsx')
+        metrics_df.to_excel(save_path, index=False)
+        print(f"Metrics saved to {save_path}")
+
+    def _plot_results(self, df):
+        import warnings
+        warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
+        plt.figure(figsize=(15, 3 * len(self.config.output_columns)))
+        df_sampled = df.iloc[::self.config.index_result, :]
+        max_points = self.config.max_plot_points
+        df_sampled = df_sampled.iloc[:max_points]
+        sampled_time = df_sampled['Index']
+
+        for idx, col in enumerate(self.config.output_columns, 1):
+            plt.subplot(len(self.config.output_columns), 1, idx)
+            plt.plot(sampled_time, df_sampled[f'{col}_True'],
+                     label='True', alpha=0.6, linewidth=1.5)
+            plt.plot(sampled_time-1, df_sampled[f'{col}_Pred'],
+                     label='Predicted (Single Step)', linestyle='--', linewidth=1)
+            plt.title(f"{col} Prediction")
+            plt.xlabel("Time Step")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(self.config.fig_filename.replace('.xlsx', '.png'), dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"Single step plot saved to ./result/predictions.png")
+
